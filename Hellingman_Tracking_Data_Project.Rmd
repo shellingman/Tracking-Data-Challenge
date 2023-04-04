@@ -1,0 +1,470 @@
+---
+title: "Tracking Data Project Long Form"
+author: "Sean Hellingman"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+\section{Discription of Problem}
+
+
+\textit{Events describe passes from open play in the same general area of the field. The player locations data is a record for the locations of the players and the ball for each of these passing events. These events can be joined together in both locations using the GameEventID field. The passing player is denoted by the IsEPlayer in the player locations data, and EPlayerID in the event data. Whether or not these individual possessions resulted in a goal is given by the IsPossGoal field. Note that the orientation of the coordinates is always going from left to right (negative to positive towards the opposition goal).}
+
+ 
+\textit{We would like you to demonstrate your skillset by using the player locations data to make insights about the probability of individual passes resulting in goals (denoted by the IsPossGoal field). We are looking for constructed aggregate measures (players in front of the passer, opponents in proximity to ball, etc..) of the player locations data that might be useful in predicting the previously stated IsPossGoal response. You do not necessarily have to make predictions on the IsPossGoal field, rather we are looking for constructed measurements of the on-field situation that might be used for such, as well as their general specific signifigance.}
+
+
+\section{Packages}
+
+The following R packages were used for this analysis.
+
+```{r packages, echo=TRUE, message=FALSE}
+set.seed(14)
+#rm(list = ls())
+if(!require(readr)) install.packages("readr")
+library(readr)
+if(!require(tidyverse)) install.packages("tidyverse")
+library(tidyverse)
+if(!require(ggplot2)) install.packages("ggplot2")
+library(ggplot2)
+#if(!require(fitdistrplus)) install.packages("fitdistrplus")
+#library(fitdistrplus)
+#if(!require(EnvStats)) install.packages("EnvStats")
+#library(EnvStats)
+if(!require(caret)) install.packages("caret")
+library(caret)
+#if(!require(AER)) install.packages("AER")
+#library(AER)
+#if(!require(iccCounts)) install.packages("iccCounts")
+#library(iccCounts)
+if(!require(lme4)) install.packages("lme4")
+library(lme4)
+if(!require(knitr)) install.packages("knitr")
+library(knitr)
+if(!require(kableExtra)) install.packages("kableExtra")
+library(kableExtra)
+if(!require(broom)) install.packages("broom")
+library(broom)
+if(!require(corrplot)) install.packages("corrplot")
+library(corrplot)
+#if(!require(ROSE)) install.packages("ROSE")
+#library(ROSE)
+#if(!require(sjPlot)) install.packages("sjPlot")
+#library(sjPlot)
+#if(!require(ICCbin)) install.packages("ICCbin")
+#library(ICCbin)
+#if(!require(stargazer)) install.packages("stargazer")
+#library(stargazer)
+
+
+```
+
+\section{Introduction}
+In order to complete this task, information from the player locations dataset was aggregated and then combined with the events dataset to determine the outcomes of the passes as they relate to immediately scoring a goal or not. Logistic regression was chosen as a modelling technique due to computational simplicity and ease of interpretation. 
+
+
+\section{Data}
+
+
+```{r data,message = FALSE}
+Events <- read_csv("Events.csv")
+PlayerLocations <- read_csv("PlayerLocations.csv")
+
+```
+
+
+To account for any potential timing errors the location of the player passing the ball at the time of the pass was considered as the reference point and not the location of the ball. The passes included in this dataset originate in roughly the same area of the pitch. They occur centrally and in the offensive half of the pitch. Therefore, very little was done to characterize the passing locations. A variable indicating the absolute distance from center on the $y$ axis was constructed.  
+
+
+The first of the aggregated variables was constructed as the number of defensive players (including the keeper) between the passer and the byline they are attacking. This variable was then refined to only include the number of players centrally between the passer and the byline they are attacking. In other words, how many defensive players are actually between the passer and the goal.
+
+Next, the same was done for attacking players ahead of the passer. Both the number of attacking players ahead of the ball and the number of attacking players centrally ahead of the ball were recorded. 
+
+A player was considered to be in a central position if they were in the middle third of the $y$ axis defined in the data. This was done because all of the passes originated in a central position and goals in soccer are commonly scored from a central position. 
+
+
+```{r BehindBall}
+
+#Use passer location instead of ball location due to potential lags
+PlayerLocations$PasserX <- PlayerLocations$IsePlayer *PlayerLocations$PlayerX
+
+PlayerLocations <- PlayerLocations %>%
+          group_by(GameEventID) %>% 
+          mutate(
+            PasserX = PasserX[which.max(abs(PasserX))]
+          )
+
+
+PlayerLocations$PasserY <- PlayerLocations$IsePlayer *PlayerLocations$PlayerY
+
+PlayerLocations <- PlayerLocations %>%
+          group_by(GameEventID) %>% 
+          mutate(
+            PasserY = PasserY[which.max(abs(PasserY))]
+          )
+
+#Number of defensive players behind the ball
+PlayerLocations$DefBehBall <- ifelse(PlayerLocations$IsTM == 0 
+                      & PlayerLocations$PlayerX > PlayerLocations$PasserX,1,0)
+
+#Number of attacking players ahead of the ball
+PlayerLocations$AttAhead <- ifelse(PlayerLocations$IsTM == 1 
+                      & PlayerLocations$PlayerX > PlayerLocations$PasserX,1,0)
+```
+
+
+
+
+```{r CentralPlayers}
+
+#Defensive Players in a Central position
+PlayerLocations$Cent <- ifelse(PlayerLocations$PlayerY + 40 < 80/3, 0, 
+                                  ifelse(PlayerLocations$PasserY + 40 > 80-80/3, 0,1))
+
+#Between Ball and Goal
+PlayerLocations$GoalDef <- PlayerLocations$Cent*PlayerLocations$DefBehBall
+
+#Attacking players in a central position ahead of the ball
+PlayerLocations$AttCent <- PlayerLocations$Cent*PlayerLocations$AttAhead
+
+#Remove Unneeded
+PlayerLocations$Cent <- NULL
+
+```
+
+
+Another potentially influential variable in determining if a pass results in a goal is the presence of defenders pressuring the passer. A function to determine the Cartesian distance of defenders to the passer was used to determine pressure. Any defenders within 2 units of distance to the passer were recorded as pressuring the pass. This variable was then simplified to a binary variable indicating if the passer was under pressure or not. 
+
+
+```{r Pressure}
+
+#Cartesian distance formula
+Distance <- function(x1,y1,x2,y2){
+  sqrt((x2-x1)^2 + (y2-y1)^2)
+}
+
+#Distance of every player from the passer
+PlayerLocations$Dist <- Distance(PlayerLocations$PlayerX,PlayerLocations$PlayerY
+                                 ,PlayerLocations$PasserX,PlayerLocations$PasserY)
+
+#Binay under pressure or not
+PlayerLocations$Pressure <- as.numeric(PlayerLocations$IsTM == 0)*
+                                  ifelse(PlayerLocations$Dist < 2,1,0)
+```
+
+
+
+```{r Aggrigate}
+
+
+Data <- PlayerLocations %>%
+  group_by(GameEventID) %>%
+  mutate(DefBehBall = cumsum(DefBehBall),AttAhead = cumsum(AttAhead),GoalDef = 
+           cumsum(GoalDef),AttCent = cumsum(AttCent),Pressure = cumsum(Pressure))
+
+Data <- Data %>%
+  group_by(GameEventID) %>%
+  slice_tail()
+
+#Remove duplicate variables
+Data <- Data %>%
+  dplyr::select(!c(BallX,BallY))
+
+```
+ 
+After the aggregated variables were constructed the data from the events dataset were matched by event IDs to create the final dataset used in the analysis. The constructed variable names and descriptions can be found in Table~\ref{table:MLS}.
+
+```{r Combine}
+
+Data <- merge(Data,Events,by = "GameEventID")
+
+#Binary factor for pressure
+table(Data$Pressure)
+
+Data$PressureFAC <- ifelse(Data$Pressure > 0,1,0)
+Data$PressureFAC <- factor(Data$PressureFAC)
+
+Data$ABSPasserY <- abs(Data$PasserY)
+
+```
+
+
+
+\begin{table}[H] \centering 
+  \caption{Constructed Variables} 
+  \label{table:MLS} 
+\begin{tabular}{@{\extracolsep{5pt}}|l|l|} 
+\cline{1-2} 
+{}&{}\\
+Label: & Description: \\ 
+\hline 
+{}&{}\\
+  DefBehBall & Defensive players between the passer and goal \\ 
+  AttAhead & Attacking players ahead of the passer \\
+  GoalDef & Defensive players centrally between the passer and goal\\
+  AttCent & Attacking players centrally ahead of the passer \\
+  Pressure & Number of defensive players within two distance units of the passer \\
+  PressureFAC & (Binary) At least one defensive player within two distance units of the passer \\
+  ABSPasserY & Absolute lateral distance of the passer from the middle of the pitch \\ 
+\hline 
+\end{tabular} 
+\end{table}
+
+
+\newpage
+
+\section{Logistic Regression}
+
+Logistic regression was chosen for this task due to a binary outcome variable, the ease of interpretation of model estimates, and the overall computational simplicity. Probit regression could also be used for the same reasons. Alternative methods such as binary classifiers, random forests, or neural networks could be used for this task but they do not offer the same transparent interpretations of the impacts of specific variables on the outcome variable.
+
+
+The linear correlations of the variables considered for the logistic regression was checked. There is some correlation between the number of attacking players ahead of the ball and the number of defenders behind the ball. This makes sense as defenders will try to mark and/or track the runs of attacking players.
+
+```{r Correlations of variables}
+
+CorDat <- Data[,c(24,10,11,12,13,15,17,23,8,27)]
+res <- cor(CorDat)
+
+corrplot(res, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45)
+
+rm(CorDat) #Not needed
+```
+
+An initial logistic regression model including the number of defensive players centrally between the passer and goal (GoalDef), the number of attacking players centrally ahead of the passer (AttCent), if the passer was under pressure or not (PressureFAC), which half the game was in (Period), The speed of the passing player (EventPlayerSpeed), the passer's $x$ coordinate (PasserX), and the absolute lateral distance on the $y$ axis of the passer from the middle of the pitch (ABSPasserY). There was very little significance in this model suggesting that something was was missing.
+
+
+Next, a logistic regression model including all of the variables from the first model and all of their interactions was estimated. This proved to be more informative as controlling for interactions in the variables yeilded significant results. 
+
+Finally, a logistic regression model including only the significant terms from the second model was estimated. Conclusions about the impacts of certain variables on the probability of scoring were drawn from this model.
+
+\subsubsection{Initial Logistic Regression Estimates}
+```{r Logistic Regression1}
+
+#BallY is an absolute distance from center
+#
+
+f1 <- glm(IsPossGoal~GoalDef+AttCent+PressureFAC+Period+EventPlayerSpeed+
+            PasserX+ABSPasserY, family = binomial, data = Data)
+#summary(f1) #Not Good...
+f1%>%
+  tidy() %>%
+  kable(digits = 4)
+```
+
+\newpage
+\subsubsection{Logistic Regression Estimates with Interactions}
+```{r Logistic Regression2}
+f2 <- glm(IsPossGoal~(GoalDef+AttCent+PressureFAC+Period+EventPlayerSpeed+
+                        PasserX+ABSPasserY)^2, family = binomial, data = Data)
+f2%>%
+  tidy() %>%
+  kable(digits = 4)
+#summary(f2) #Better
+```
+
+
+\subsubsection{Final Logistic Regression Model Estimates}
+```{r Logistic Regression Final}
+
+#Significant Terms from f2
+f3 <- glm(IsPossGoal~(GoalDef+AttCent+PasserX+GoalDef:PasserX+AttCent:PasserX), 
+          family = binomial, data = Data)
+#summary(f3) #This is the model!
+
+f3%>%
+  tidy() %>%
+  kable(digits = 4)
+```
+
+
+
+
+
+
+These estimates are presented in the \textit{Log Odds} format, meaning that a positive coefficient indicates an increase in probability of a goal being scored and negative values indicate a decrease in probability of a goal being scored per unit change of the variables.
+
+When controlling for interactions, an increase in the number of defenders centrally between the passer and the goal decreases the probability of the pass leading to a goal. Furthermore, an increase in attacking players centrally ahead of the ball increases the probability of the pass leading to a goal. Both of these results are intuitive from a soccer point of view.
+
+As the passer gets closer to the goal the probability of the pass leading to a goal being scored seems to diminish. This could be because as the passer gets closer to the goal, the spaces between defenders and attackers is smaller, thus making it more difficult to score. 
+
+\subsection{Stepwise Estimation}
+
+A stepwise algorithm was used to estimate the best model based on the AIC. This methodology did not appear to be very informative. 
+
+```{r Selection}
+#Let's try AIC with interactions and see how they compare
+
+#Best models based on AIC
+
+#null model
+f0 = glm(formula = IsPossGoal ~ 1, family = binomial, data = Data)
+#summary(f0)
+
+
+#this adds and takes away lower is min scope and upper is max scope (included variables)
+#AIC
+f_step_aic <- step(f0, scope = list(upper = ~DefBehBall+AttAhead+GoalDef+
+                                      AttCent+Pressure+Period+EventPlayerSpeed+
+GoalDef:AttCent  + 
+GoalDef:PressureFAC   +        
+GoalDef:Period    +               
+GoalDef:EventPlayerSpeed   +   
+GoalDef:PasserX   +             
+GoalDef:ABSPasserY  +          
+AttCent:PressureFAC   +           
+AttCent:Period     +             
+AttCent:EventPlayerSpeed +         
+AttCent:PasserX +              
+AttCent:ABSPasserY  +             
+PressureFAC:Period +             
+PressureFAC:EventPlayerSpeed   + 
+PressureFAC:PasserX  +          
+PressureFAC:ABSPasserY +          
+Period:EventPlayerSpeed   +       
+Period:PasserX +                 
+Period:ABSPasserY +              
+EventPlayerSpeed:PasserX  +      
+EventPlayerSpeed:ABSPasserY +   
+PasserX:ABSPasserY,lower = ~1),
+                   trace = FALSE, #print all the steps
+                   direction = "both")
+#summary(f_step_aic) #This is not very insightful
+
+
+
+
+```
+
+\section{Random Slopes}
+
+
+A random slopes model was explored as there is a potential second source of variability from the player actually passing the ball. Although, there were too many passers with only a single observation to determine if the second source of variability was actually significant, the model was able to identify which player has the largest individual intercept. In other words, based on the random slopes model, player 315169 making the pass has the highest probability of a goal occurring. 
+
+```{r Random Slopes}
+
+#Significant Terms from f2
+
+Data$EventPlayerIDFAC <- factor(Data$EventPlayerID)
+
+
+RS1 <- glmer(IsPossGoal~GoalDef+AttCent+PasserX+GoalDef:PasserX+AttCent:PasserX + 
+               (1| EventPlayerIDFAC),
+                family = binomial,data=Data, nAGQ=0)
+#summary(RS1) 
+
+#plot_model(RS1,type = "re",show.values = F)
+RandomSlopes <- coef(RS1)$EventPlayerIDFAC
+
+RandomSlopes %>% slice_max(`(Intercept)`)
+
+```
+
+
+
+\section{Upsampling}
+
+
+This technique is used to help balance the sample as goals being scored from the passes are rare. As only around 6.9\% of the passes actually lead to goals, this is an example of a rare event. Sampling techniques like this are more commonly used for predictive models but may uncover some other variables of interest. By balancing the sample, more may be learned about the rare events, in this case actually scoring goals. A pseudo random sample of 80\% was taken to evaluate the predictive powers of the model determined through upsampling. 
+
+```{r Upsample}
+
+set.seed(1234)
+Data$IsPossGoal <- factor(Data$IsPossGoal)
+index<-createDataPartition(Data$GameEventID,p=0.8,list=FALSE) #80% for training
+train<-Data[index,]
+test<-Data[-index,]
+
+
+trainup<-upSample(x=train,
+                  y=train$IsPossGoal)
+
+
+table(trainup$IsPossGoal)
+
+f4 <- glm(IsPossGoal~(GoalDef+AttCent+PressureFAC+Period+EventPlayerSpeed+
+                        PasserX+ABSPasserY)^2, family = binomial, data = trainup)
+#summary(f4) #Many more significant 
+
+
+```
+
+The predictive capabilities of the model with the significant variables identified by upsampling and model with the significant variables identified before upsampling were compared. Both models for this part were trained on the upsampled training set. This was done to see if attention should be paid to the model identified through upsampling. 
+
+```{r Upsample Predictions}
+
+set.seed(1234)
+
+#Old on training
+#Significant Terms from f2
+f5 <- glm(IsPossGoal~(GoalDef+AttCent+PasserX+GoalDef:PasserX+AttCent:PasserX), 
+          family = binomial, data = trainup)
+#summary(f5)
+
+
+#New On Upsampled
+f6 <- glm(IsPossGoal~GoalDef+AttCent+PressureFAC+PasserX+ABSPasserY+
+            GoalDef:PasserX+AttCent:PressureFAC+AttCent:EventPlayerSpeed+
+            AttCent:PasserX+PressureFAC:Period+PressureFAC:ABSPasserY+
+            Period:EventPlayerSpeed+Period:PasserX+Period:ABSPasserY+
+            PasserX:ABSPasserY,family = binomial, data = trainup)
+#summary(f6)
+            
+            
+
+
+predOLD <- predict(f5,test, type="response")
+predOLD <- as.integer(predOLD>0.5)
+confusionMatrix(as.factor(predOLD),test$IsPossGoal)
+
+
+predNEW <- predict(f6,test, type="response")
+predNEW <- as.integer(predNEW>0.5)
+confusionMatrix(as.factor(predNEW),test$IsPossGoal)
+
+
+```
+
+\subsection{Interpretations}
+
+Directly comparing the predictive capabilities of both models based on their accuracy and Kappa values suggests that the model obtained from upsampling is slightly more accurate at predicting this test set than the model identified earlier.
+
+\subsubsection{Model Estimates from Upsampling}
+```{r Model Results}
+
+f6 %>%
+  tidy() %>%
+  kable(digits = 4)
+
+
+```
+
+
+The model estimated from upsampling identifies the same significant variables as the earlier model. The numbers of defenders and attackers in central positions negatively and positively impact the probabilities of scoring respectively. The closer the passer is to the goal reduces the probability that the pass results in a goal. 
+
+This model also identified other potentially significant variables and interactions. Any pressure on the passer seems to significantly decrease the probability that the pass results in a goal. Furthermore, it seems that the further the passer is from the center of the $y$ axis, the more likely that pass is to result in a goal. A possible explanation for this is that angled passes may be more difficult for defenders to intercept than straight passes. It is important to interpret these results with some caution as the number of goals in the sample was artificially increased. 
+
+\newpage
+
+\section{Conclusions}
+
+When controlling for interactions, an increase in the number of defenders centrally between the passer and the goal decreases the probability of the pass leading to a goal. An increase in attacking players centrally ahead of the ball increases the probability of the pass leading to a goal. As the passer gets closer to the goal the probability of the pass leading to a goal being scored decreases. Any pressure on the passer may significantly decrease the probability that the pass results in a goal. Furthermore, it seems that the further the passer is from the center of the $y$ axis, the more likely that pass is to result in a goal.
+
+Other information may be relevant to the probability of a pass resulting in a goal. As was touched on with the mixed effects modelling, who is passing the ball may greatly impact the outcome. Also, which defensive players are behind the ball and which attacking players are ahead of the ball may impact the probabilities. 
+
+The distance between the second to last defender and the goal could be of interest, as this could indicate how much space exists for the pass to be played into. A density of defenders, or the area of a convex hull around them could also be considered. All of these variables would probably be correlated with the $x$ position of the passer and may or may not be useful. 
+
+
+\section{Resources}
+
+Logistic Regression: https://www.r-bloggers.com/2015/09/how-to-perform-a-logistic-regression-in-r/
+
+Mixed Effects Logistic Regression: https://stats.oarc.ucla.edu/r/dae/mixed-effects-logistic-regression/
+
+Unbalanced Samples: https://www.r-bloggers.com/2019/04/methods-for-dealing-with-imbalanced-data/
+
